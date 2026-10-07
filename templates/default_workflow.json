@@ -1,65 +1,113 @@
 {
-  "3": {
-    "inputs": {
-      "seed": 156680208700286,
-      "steps": 20,
-      "cfg": 8.0,
-      "sampler_name": "euler",
-      "scheduler": "normal",
-      "denoise": 1.0,
-      "model": ["4", 0],
-      "positive": ["6", 0],
-      "negative": ["7", 0],
-      "latent_image": ["5", 0]
-    },
-    "class_type": "KSampler"
-  },
   "4": {
+    "class_type": "UNETLoader",
     "inputs": {
-      "ckpt_name": "sd_xl_base_1.0.safetensors"
-    },
-    "class_type": "CheckpointLoaderSimple"
+      "unet_name": "z_image_turbo_bf16.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "10": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "device": "default",
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "lumina2"
+    }
+  },
+  "11": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
   },
   "5": {
+    "class_type": "EmptySD3LatentImage",
     "inputs": {
-      "width": 1024,
-      "height": 1024,
-      "batch_size": 1
-    },
-    "class_type": "EmptyLatentImage"
+      "batch_size": 1,
+      "height": 1080,
+      "width": 1920
+    }
   },
   "6": {
-    "inputs": {
-      "text": "POSITIVE_PROMPT_PLACEHOLDER",
-      "clip": ["4", 1]
-    },
-    "class_type": "CLIPTextEncode",
     "_meta": {
       "title": "CLIP Text Encode (Positive)"
+    },
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "10",
+        0
+      ],
+      "text": "POSITIVE_PROMPT_PLACEHOLDER"
     }
   },
   "7": {
+    "class_type": "ConditioningZeroOut",
     "inputs": {
-      "text": "NEGATIVE_PROMPT_PLACEHOLDER",
-      "clip": ["4", 1]
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP Text Encode (Negative)"
+      "conditioning": [
+        "6",
+        0
+      ]
+    }
+  },
+  "12": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "shift": 3.0
+    }
+  },
+  "3": {
+    "class_type": "KSampler",
+    "inputs": {
+      "scheduler": "simple",
+      "cfg": 1.0,
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ],
+      "steps": 8,
+      "positive": [
+        "6",
+        0
+      ],
+      "seed": 156680208700286,
+      "denoise": 1.0,
+      "sampler_name": "res_multistep",
+      "model": [
+        "12",
+        0
+      ]
     }
   },
   "8": {
+    "class_type": "VAEDecode",
     "inputs": {
-      "samples": ["3", 0],
-      "vae": ["4", 2]
-    },
-    "class_type": "VAEDecode"
+      "samples": [
+        "3",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ]
+    }
   },
   "9": {
+    "class_type": "SaveImage",
     "inputs": {
-      "filename_prefix": "ComfyUI",
-      "images": ["8", 0]
-    },
-    "class_type": "SaveImage"
+      "filename_prefix": "ImageMCP/Z_Image_Turbo",
+      "images": [
+        "8",
+        0
+      ]
+    }
   }
 }

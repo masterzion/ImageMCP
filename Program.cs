@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ImageMCP.Services;
@@ -134,6 +135,10 @@ namespace ImageMCP
 
     public class ToolResult
     {
+        [JsonPropertyName("structuredContent")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public object? StructuredContent { get; set; }
+
         [JsonPropertyName("content")]
         public List<object> Content { get; set; } = new();
 
@@ -147,7 +152,8 @@ namespace ImageMCP
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            WriteIndented = false
+            WriteIndented = false,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
         };
 
         public static ComfyUISettings _comfySettings = new();
@@ -253,11 +259,10 @@ namespace ImageMCP
                 if (string.IsNullOrWhiteSpace(bodyText))
                 {
                     context.Response.StatusCode = 400;
-                    context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonRpcResponse
+                    await WriteMcpResponseAsync(context, new JsonRpcResponse
                     {
                         Error = new JsonRpcError { Code = -32600, Message = "Invalid Request: empty body" }
-                    }, options));
+                    });
                     return;
                 }
 
@@ -269,8 +274,7 @@ namespace ImageMCP
                 catch (JsonException jsonEx)
                 {
                     context.Response.StatusCode = 400;
-                    context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonRpcResponse
+                    await WriteMcpResponseAsync(context, new JsonRpcResponse
                     {
                         Error = new JsonRpcError
                         {
@@ -278,34 +282,41 @@ namespace ImageMCP
                             Message = "Parse error - Invalid JSON",
                             Data = jsonEx.Message
                         }
-                    }, options));
+                    });
                     return;
                 }
 
                 if (request == null)
                 {
                     context.Response.StatusCode = 400;
-                    context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonRpcResponse
+                    await WriteMcpResponseAsync(context, new JsonRpcResponse
                     {
                         Error = new JsonRpcError { Code = -32600, Message = "Invalid Request" }
-                    }, options));
+                    });
                     return;
                 }
 
                 var response = await HandleMcpRequest(request);
-                context.Response.ContentType = "application/json";
-                await JsonSerializer.SerializeAsync(context.Response.Body, response, options);
+                await WriteMcpResponseAsync(context, response);
             }
             catch (Exception ex)
             {
                 context.Response.StatusCode = 500;
-                context.Response.ContentType = "application/json";
-                await context.Response.WriteAsync(JsonSerializer.Serialize(new JsonRpcResponse
+                await WriteMcpResponseAsync(context, new JsonRpcResponse
                 {
                     Error = new JsonRpcError { Code = -32603, Message = "Internal error", Data = ex.Message }
-                }));
+                });
             }
+        }
+
+        private static async Task WriteMcpResponseAsync(HttpContext context, JsonRpcResponse response)
+        {
+            // Serialize once so the log contains exactly the JSON sent to the client,
+            // including the complete base64 image data and unescaped image URLs.
+            var responseJson = JsonSerializer.Serialize(response, JsonOptions);
+            _loggerFactory.CreateLogger("MCP").LogInformation("MCP response: {Response}", responseJson);
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(responseJson, context.RequestAborted);
         }
 
         private static async Task<JsonRpcResponse> HandleMcpRequest(JsonRpcRequest request)
@@ -330,7 +341,7 @@ namespace ImageMCP
                                 new Tool
                                 {
                                     Name = "generate_image",
-                                    Description = "Generate an image using ComfyUI based on a text prompt",
+                                    Description = "Generate an image using ComfyUI based on a text prompt. Waits until generation completes and returns the image and ready-to-display Markdown. Include the returned image Markdown directly in your message body so the user can see the image.",
                                     InputSchema = new
                                     {
                                         type = "object",
@@ -438,12 +449,12 @@ namespace ImageMCP
                     throw new FileNotFoundException($"Workflow template not found: {templatePath}");
                 }
 
-                var comfyClient = new ComfyUIClient(_comfySettings, _loggerFactory.CreateLogger<ComfyUIClient>());
+                using var comfyClient = new ComfyUIClient(_comfySettings, _loggerFactory.CreateLogger<ComfyUIClient>());
                 var templateManager = new WorkflowTemplateManager(_loggerFactory.CreateLogger<WorkflowTemplateManager>());
 
                 // Load template
                 var workflowJson = await File.ReadAllTextAsync(templatePath);
-                var template = JsonDocument.Parse(workflowJson);
+                using var template = JsonDocument.Parse(workflowJson);
                 
                 // Check if it's UI format (has "nodes" array) or API format (node IDs as keys)
                 bool isApiFormat = !template.RootElement.TryGetProperty("nodes", out _);
@@ -466,7 +477,6 @@ namespace ImageMCP
                 
                 _loggerFactory.CreateLogger("ImageGen").LogInformation("Submitting workflow with prompt: {Prompt}", input.Prompt);
 
-                await comfyClient.ConnectAsync();
                 var promptId = await comfyClient.SubmitWorkflowAsync(finalWorkflowJson);
 
                 var completed = await comfyClient.WaitForCompletionAsync(promptId);
@@ -475,7 +485,7 @@ namespace ImageMCP
                     throw new InvalidOperationException("Workflow execution did not complete successfully");
                 }
 
-                var images = await comfyClient.GetImagesAsync(promptId);
+                var images = await comfyClient.GetGeneratedImagesAsync(promptId);
 
                 if (images.Count == 0)
                 {
@@ -489,7 +499,7 @@ namespace ImageMCP
                                 Text = "Image generation completed but no images were produced."
                             }
                         },
-                        IsError = false
+                        IsError = true
                     };
 
                     return new JsonRpcResponse
@@ -499,21 +509,34 @@ namespace ImageMCP
                     };
                 }
 
-                var base64Image = Convert.ToBase64String(images[0]);
+                var markdown = string.Join("\n\n", images.Select((image, index) =>
+                    $"![Generated image {index + 1}]({image.Url})"));
+                foreach (var image in images)
+                {
+                    _loggerFactory.CreateLogger("ImageGen").LogInformation("Generated image URL: {ImageUrl}", image.Url);
+                }
 
                 var result = new ToolResult
                 {
-                    Content = new List<object>
+                    Content = images.Select(image => (object)new ImageToolResult
                     {
-                        new ImageToolResult
-                        {
-                            Type = "image",
-                            Data = base64Image,
-                            MimeType = "image/png"
-                        }
+                        Data = Convert.ToBase64String(image.Data),
+                        MimeType = "image/png"
+                    }).ToList(),
+                    StructuredContent = new
+                    {
+                        prompt_id = promptId,
+                        image_url = images[0].Url,
+                        image_urls = images.Select(image => image.Url).ToArray(),
+                        markdown
                     },
                     IsError = false
                 };
+                result.Content.Add(new ToolCallResult
+                {
+                    Text = $"Display the generated image in your message body using this Markdown:\n\n{markdown}\n\n" +
+                        string.Join("\n", images.Select((image, index) => $"Image {index + 1} URL: {image.Url}"))
+                });
 
                 return new JsonRpcResponse
                 {

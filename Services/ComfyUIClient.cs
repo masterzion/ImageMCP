@@ -48,7 +48,7 @@ public class ComfyUIClient : IDisposable
             await _webSocket.ConnectAsync(new Uri(wsEndpoint), cancellationToken);
             _logger.LogInformation("Connected to ComfyUI WebSocket with client ID: {ClientId}", _clientId);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Failed to connect to ComfyUI WebSocket");
             throw new InvalidOperationException($"Could not connect to ComfyUI at {wsEndpoint}", ex);
@@ -75,11 +75,11 @@ public class ComfyUIClient : IDisposable
 
         _logger.LogDebug("Submitting workflow to ComfyUI: {Url}", url);
 
-        var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
+        using var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
 
         try
         {
-            var response = await _httpClient.PostAsync(url, content, cancellationToken);
+            using var response = await _httpClient.PostAsync(url, content, cancellationToken);
             var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
 
             if (!response.IsSuccessStatusCode)
@@ -102,7 +102,7 @@ public class ComfyUIClient : IDisposable
 
             return promptResponse.PromptId;
         }
-        catch (Exception ex) when (ex is not InvalidOperationException)
+        catch (Exception ex) when (ex is not InvalidOperationException && ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Error submitting workflow to ComfyUI");
             throw new InvalidOperationException($"Failed to submit workflow to ComfyUI at {url}", ex);
@@ -110,100 +110,141 @@ public class ComfyUIClient : IDisposable
     }
 
     /// <summary>
-    /// Wait for workflow completion via WebSocket
+    /// Wait for completion, using history as a fallback for missed WebSocket events.
     /// </summary>
     public async Task<bool> WaitForCompletionAsync(
         string promptId, 
         CancellationToken cancellationToken = default)
     {
-        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+        _logger.LogInformation("Waiting for prompt completion: {PromptId}", promptId);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(_settings.TimeoutSeconds));
+        var token = timeoutCts.Token;
+        Task<bool>? socketTask = null;
+        try
+        {
+            // Poll history even while the WebSocket connection is being established.
+            socketTask = MonitorExecutionAsync(promptId, token);
+
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                if (await IsHistoryCompleteAsync(promptId, token))
+                {
+                    return true;
+                }
+                var delay = Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _settings.PollIntervalSeconds)), token);
+                if (socketTask != null && await Task.WhenAny(socketTask, delay) == socketTask)
+                {
+                    if (await socketTask)
+                    {
+                        return true;
+                    }
+                    // History remains available after the socket disconnects.
+                    socketTask = null;
+                }
+                await delay;
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Workflow execution timed out after {_settings.TimeoutSeconds} seconds");
+        }
+        finally
+        {
+            timeoutCts.Cancel();
+            if (socketTask != null)
+            {
+                try
+                {
+                    await socketTask;
+                }
+                catch (Exception)
+                {
+                    // Observe the receiver after cancellation; the result was handled above.
+                }
+            }
+        }
+    }
+
+    private async Task<bool> IsHistoryCompleteAsync(string promptId, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.GetAsync($"{GetHttpEndpoint()}/history/{Uri.EscapeDataString(promptId)}", cancellationToken);
+        response.EnsureSuccessStatusCode();
+        var history = JsonSerializer.Deserialize<Dictionary<string, ComfyHistoryResponse>>(
+            await response.Content.ReadAsStringAsync(cancellationToken));
+        if (history == null || !history.TryGetValue(promptId, out var entry) || !entry.Status.HasValue)
+        {
+            return false;
+        }
+
+        var status = entry.Status.Value;
+        if (status.TryGetProperty("status_str", out var statusName) && statusName.GetString() == "error")
+        {
+            throw new InvalidOperationException($"Workflow execution failed: {status.GetRawText()}");
+        }
+        return status.TryGetProperty("completed", out var completed) && completed.ValueKind == JsonValueKind.True;
+    }
+
+    private async Task<bool> MonitorExecutionAsync(string promptId, CancellationToken cancellationToken)
+    {
+        try
         {
             await ConnectAsync(cancellationToken);
         }
-
-        _logger.LogInformation("Waiting for prompt completion: {PromptId}", promptId);
-
-        var buffer = new byte[1024 * 4];
-        var startTime = DateTime.UtcNow;
-        var timeout = TimeSpan.FromSeconds(_settings.TimeoutSeconds);
-
-        try
+        catch (InvalidOperationException) when (!cancellationToken.IsCancellationRequested)
         {
-            while (_webSocket!.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
-            {
-                // Check timeout
-                if (DateTime.UtcNow - startTime > timeout)
-                {
-                    throw new TimeoutException(
-                        $"Workflow execution timed out after {timeout.TotalSeconds} seconds");
-                }
-
-                var result = await _webSocket.ReceiveAsync(
-                    new ArraySegment<byte>(buffer), 
-                    cancellationToken);
-
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    _logger.LogWarning("WebSocket closed by server");
-                    return false;
-                }
-
-                if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    var messageText = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    var message = JsonSerializer.Deserialize<ComfyWebSocketMessage>(messageText);
-
-                    if (message != null)
-                    {
-                        _logger.LogDebug("Received WebSocket message: {Type}", message.Type);
-
-                        // Check for workflow execution complete
-                        if (message.Type == "execution_success")
-                        {
-                            if (message.Data.HasValue && 
-                                message.Data.Value.TryGetProperty("prompt_id", out var msgPromptId))
-                            {
-                                if (msgPromptId.GetString() == promptId)
-                                {
-                                    _logger.LogInformation("Workflow execution completed: {PromptId}", promptId);
-                                    return true;
-                                }
-                            }
-                        }
-
-                        // Log node-level events as debug (not workflow completion)
-                        if (message.Type == "executed" || message.Type == "execution_cached")
-                        {
-                            _logger.LogDebug("Node {Event} for prompt {PromptId}", message.Type, promptId);
-                        }
-
-                        // Check for errors
-                        if (message.Type == "execution_error")
-                        {
-                            var errorMsg = message.Data?.GetRawText() ?? "Unknown error";
-                            _logger.LogError("Workflow execution failed: {Error}", errorMsg);
-                            throw new InvalidOperationException($"Workflow execution failed: {errorMsg}");
-                        }
-
-                        // Log progress
-                        if (message.Type == "progress" && message.Data.HasValue)
-                        {
-                            if (message.Data.Value.TryGetProperty("value", out var value) &&
-                                message.Data.Value.TryGetProperty("max", out var max))
-                            {
-                                _logger.LogDebug("Progress: {Value}/{Max}", value.GetInt32(), max.GetInt32());
-                            }
-                        }
-                    }
-                }
-            }
-
+            _logger.LogWarning("WebSocket unavailable; monitoring history for {PromptId}", promptId);
             return false;
         }
-        catch (Exception ex) when (ex is not TimeoutException && ex is not InvalidOperationException)
+        var buffer = new byte[4096];
+        try
         {
-            _logger.LogError(ex, "Error waiting for workflow completion");
-            throw new InvalidOperationException("Error monitoring workflow execution", ex);
+            while (_webSocket!.State == WebSocketState.Open)
+            {
+                using var messageBuffer = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        return false;
+                    }
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        messageBuffer.Write(buffer, 0, result.Count);
+                    }
+                } while (!result.EndOfMessage);
+
+                if (result.MessageType != WebSocketMessageType.Text)
+                {
+                    continue;
+                }
+                var message = JsonSerializer.Deserialize<ComfyWebSocketMessage>(messageBuffer.ToArray());
+                if (message?.Data is not JsonElement data ||
+                    !data.TryGetProperty("prompt_id", out var id) || id.GetString() != promptId)
+                {
+                    continue;
+                }
+
+                if (message.Type is "execution_error" or "execution_interrupted")
+                {
+                    throw new InvalidOperationException($"Workflow execution failed: {data.GetRawText()}");
+                }
+                if (message.Type == "execution_success" ||
+                    (message.Type == "executing" && data.TryGetProperty("node", out var node) && node.ValueKind == JsonValueKind.Null))
+                {
+                    _logger.LogInformation("Workflow execution completed: {PromptId}", promptId);
+                    return true;
+                }
+            }
+            return false;
+        }
+        catch (Exception ex) when (ex is WebSocketException or JsonException)
+        {
+            _logger.LogWarning(ex, "WebSocket monitoring stopped; using history for {PromptId}", promptId);
+            return false;
         }
     }
 
@@ -214,13 +255,18 @@ public class ComfyUIClient : IDisposable
         string promptId, 
         CancellationToken cancellationToken = default)
     {
+        var images = await GetGeneratedImagesAsync(promptId, cancellationToken);
+        return images.Select(image => image.Data).ToList();
+    }
+
+    public async Task<List<GeneratedImage>> GetGeneratedImagesAsync(
+        string promptId,
+        CancellationToken cancellationToken = default)
+    {
         var httpEndpoint = GetHttpEndpoint();
         var url = $"{httpEndpoint}/history/{promptId}";
 
         _logger.LogDebug("Fetching images from history: {Url}", url);
-
-        // Give ComfyUI a moment to finalize history after execution completes
-        await Task.Delay(1000, cancellationToken);
 
         // Retry logic - sometimes history takes a moment to be available
         const int maxRetries = 10;
@@ -236,7 +282,7 @@ public class ComfyUIClient : IDisposable
                     await Task.Delay(retryDelayMs, cancellationToken);
                 }
 
-                var response = await _httpClient.GetAsync(url, cancellationToken);
+                using var response = await _httpClient.GetAsync(url, cancellationToken);
                 var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
 
                 if (!response.IsSuccessStatusCode)
@@ -256,11 +302,11 @@ public class ComfyUIClient : IDisposable
                     }
                     
                     _logger.LogWarning("No history found for prompt after {Attempts} attempts: {PromptId}", maxRetries, promptId);
-                    return new List<byte[]>();
+                    return new List<GeneratedImage>();
                 }
 
                 var promptHistory = history[promptId];
-                var images = new List<byte[]>();
+                var images = new List<GeneratedImage>();
 
                 if (promptHistory.Outputs == null)
                 {
@@ -278,7 +324,7 @@ public class ComfyUIClient : IDisposable
                             var imageData = await DownloadImageAsync(imageInfo, cancellationToken);
                             if (imageData != null)
                             {
-                                images.Add(imageData);
+                                images.Add(new GeneratedImage(imageData, GetImageUrl(imageInfo)));
                             }
                         }
                     }
@@ -287,7 +333,7 @@ public class ComfyUIClient : IDisposable
                 _logger.LogInformation("Retrieved {Count} images for prompt: {PromptId}", images.Count, promptId);
                 return images;
             }
-            catch (Exception ex) when (ex is not InvalidOperationException && attempt < maxRetries - 1)
+            catch (Exception ex) when (ex is not InvalidOperationException && ex is not OperationCanceledException && attempt < maxRetries - 1)
             {
                 _logger.LogDebug(ex, "Error fetching images (attempt {Attempt}/{MaxRetries}), retrying...", attempt + 1, maxRetries);
             }
@@ -303,14 +349,13 @@ public class ComfyUIClient : IDisposable
         ComfyImageInfo imageInfo, 
         CancellationToken cancellationToken)
     {
-        var httpEndpoint = GetHttpEndpoint();
-        var url = $"{httpEndpoint}/view?filename={imageInfo.Filename}&subfolder={imageInfo.Subfolder}&type={imageInfo.Type}";
+        var url = GetImageUrl(imageInfo);
 
         _logger.LogDebug("Downloading image: {Filename}", imageInfo.Filename);
 
         try
         {
-            var response = await _httpClient.GetAsync(url, cancellationToken);
+            using var response = await _httpClient.GetAsync(url, cancellationToken);
             
             if (!response.IsSuccessStatusCode)
             {
@@ -320,12 +365,15 @@ public class ComfyUIClient : IDisposable
 
             return await response.Content.ReadAsByteArrayAsync(cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Error downloading image: {Filename}", imageInfo.Filename);
             return null;
         }
     }
+
+    private string GetImageUrl(ComfyImageInfo imageInfo) =>
+        $"{GetHttpEndpoint()}/view?filename={Uri.EscapeDataString(imageInfo.Filename)}&subfolder={Uri.EscapeDataString(imageInfo.Subfolder)}&type={Uri.EscapeDataString(imageInfo.Type)}";
 
     private string GetHttpEndpoint()
     {
